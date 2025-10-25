@@ -41,10 +41,17 @@ class SearchIntent(BaseModel):
     region: str = "US"
     strictness: Literal["exact", "close", "fuzzy"] = "close"
 
+class Image(BaseModel):
+    url: str
+    width: Optional[int] = None
+    height: Optional[int] = None
+    alt: Optional[str] = None
+
 class ProductItem(BaseModel):
     title: str
+    normalized_title: Optional[str] = None
     price: Optional[float] = None
-    currency: str = "USD"
+    currency: Optional[str] = "USD"
     url: str
     source: str
     match_score: float
@@ -52,6 +59,8 @@ class ProductItem(BaseModel):
     sentiment_score: Optional[float] = None
     fake_review_probability: Optional[float] = None
     availability: Optional[str] = None
+    primary_image_url: Optional[str] = None
+    images: List[Image] = Field(default_factory=list)
 
 class SearchResponse(BaseModel):
     query: str
@@ -76,6 +85,78 @@ async def retry_with_backoff(func, max_retries=2):
                 await asyncio.sleep(wait_time)
             else:
                 raise
+
+MANUFACTURER_DOMAINS = ["apple.com", "samsung.com", "sony.com", "lg.com", "dell.com", "hp.com", "microsoft.com", "google.com", "lenovo.com", "asus.com"]
+MAJOR_RETAILERS = ["amazon.com", "bestbuy.com", "walmart.com", "target.com", "homedepot.com", "wayfair.com", "ikea.com", "crateandbarrel.com", "lowes.com", "overstock.com", "ebay.com", "etsy.com", "costco.com", "macys.com"]
+MARKETPLACES = ["ebay.com", "etsy.com", "mercari.com", "poshmark.com", "offerup.com"]
+
+def get_domain_tier(url: str) -> int:
+    from urllib.parse import urlparse
+    domain = urlparse(url).netloc.replace("www.", "").lower()
+    
+    if any(mfr in domain for mfr in MANUFACTURER_DOMAINS):
+        return 3
+    if any(retailer in domain for retailer in MAJOR_RETAILERS):
+        return 2
+    if any(market in domain for market in MARKETPLACES):
+        return 1
+    return 0
+
+def is_ecommerce_domain(url: str) -> bool:
+    tier = get_domain_tier(url)
+    return tier > 0
+
+async def normalize_name(text: str) -> dict:
+    try:
+        async def call_normalizer():
+            response = await client.chat.completions.create(
+                model="speed",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You normalize retail product names. Output compact, literal phrases that capture the core item. Keep color and one or two critical qualifiers (size, model family). Drop pack counts, marketing adjectives, and usage contexts. Max ~3 tokens (2-4 words). Return JSON only per schema."
+                    },
+                    {
+                        "role": "user",
+                        "content": f"""Normalize this product name: {text}
+
+Return ONLY JSON with these fields:
+- normalized_query: string (e.g., "black accent chair")
+- keywords: array of strings (e.g., ["accent chair", "black", "vanity"])
+- keep_model: boolean (true if a model id must be preserved)
+
+Examples:
+"Yaheetech Black Accent Chairs Set of 2, Cozy Velvet Barrel Chair..." → {{"normalized_query": "black accent chair", "keywords": ["accent chair", "black", "vanity"], "keep_model": false}}
+"Apple iPhone 16 Pro Max 256GB (Model XYZ123)" → {{"normalized_query": "iPhone 16 Pro Max", "keywords": ["iPhone", "16 Pro Max"], "keep_model": true}}
+"Samsung 75-inch QLED 4K Smart TV" → {{"normalized_query": "75-inch QLED TV", "keywords": ["QLED TV", "75-inch", "Samsung"], "keep_model": false}}
+
+Return ONLY JSON, no other text."""
+                    }
+                ],
+                response_format={"type": "json_object"}
+            )
+            return response
+        
+        response = await retry_with_backoff(call_normalizer)
+        content = response.choices[0].message.content.strip()
+        
+        try:
+            normalized_data = json.loads(content)
+            return normalized_data
+        except json.JSONDecodeError:
+            return {
+                "normalized_query": text,
+                "keywords": [text],
+                "keep_model": False
+            }
+    
+    except Exception as e:
+        print(f"Normalization failed: {str(e)}")
+        return {
+            "normalized_query": text,
+            "keywords": [text],
+            "keep_model": False
+        }
 
 @app.post("/api/chat/intake", response_model=ChatIntakeResponse)
 async def chat_intake(request: ChatRequest):
@@ -123,23 +204,23 @@ async def chat_intake(request: ChatRequest):
             
         intent = SearchIntent(**intent_data)
         
+        normalized = await normalize_name(intent.query_text)
+        intent.query_text = normalized.get("normalized_query", intent.query_text)
+        
         return ChatIntakeResponse(intent=intent)
     
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Chat intake failed: {str(e)}")
 
-async def search_products(intent: SearchIntent) -> List[dict]:
+async def search_products(intent: SearchIntent, normalized_query: str) -> List[dict]:
     try:
-        hints = []
-        if intent.brand:
-            hints.append(f"brand:{intent.brand}")
-        if intent.model:
-            hints.append(f"model:{intent.model}")
-        if intent.core_specs:
-            hints.append(f"specs:{','.join(intent.core_specs)}")
+        manufacturer_domains = ", ".join(MANUFACTURER_DOMAINS[:5])
+        retailer_domains = ", ".join(MAJOR_RETAILERS[:10])
         
-        hints_str = " ".join(hints) if hints else ""
-        objective = f"Find live product pages matching: {intent.query_text} with hints {hints_str}. Prefer manufacturer and major retailer PDPs in the US that show current price. Exclude forums/news."
+        objective = f"""Find US ecommerce product purchase pages for: "{normalized_query}". 
+Strictly prioritize PDPs from: {manufacturer_domains}, {retailer_domains}. 
+Return URLs that display current price. Exclude forums/news/review-only pages. 
+Include synonyms where helpful (e.g., "sofa" for "couch"). Provide at least 8 PDPs if available."""
         
         async def call_search():
             async with httpx.AsyncClient(timeout=30.0) as http_client:
@@ -159,15 +240,24 @@ async def search_products(intent: SearchIntent) -> List[dict]:
                 return response.json()
         
         search_result = await retry_with_backoff(call_search)
-        return search_result.get("results", [])
+        results = search_result.get("results", [])
+        
+        ecommerce_results = [r for r in results if is_ecommerce_domain(r.get("url", ""))]
+        
+        if len(ecommerce_results) >= 5:
+            return ecommerce_results
+        else:
+            return results
     
     except Exception as e:
         print(f"Search failed: {str(e)}")
         return []
 
-async def extract_product_details(url: str, excerpts: List[str], query_text: str) -> Optional[dict]:
+async def extract_product_details(url: str, excerpts: List[str], normalized_query: str) -> Optional[dict]:
     try:
         excerpt_text = " ".join(excerpts[:3]) if excerpts else ""
+        domain_tier = get_domain_tier(url)
+        tier_name = "manufacturer" if domain_tier == 3 else "major retailer" if domain_tier == 2 else "marketplace" if domain_tier == 1 else "other"
         
         async def call_extract():
             response = await client.chat.completions.create(
@@ -175,22 +265,36 @@ async def extract_product_details(url: str, excerpts: List[str], query_text: str
                 messages=[
                     {
                         "role": "system",
-                        "content": "You extract product details from retailer/manufacturer pages and return strict JSON."
+                        "content": "You extract structured product data from ecommerce PDPs. Prefer official title, price, currency, availability, model, and review snippets. Also extract image candidates (primary image + gallery). Return strict JSON per schema."
                     },
                     {
                         "role": "user",
-                        "content": f"""User query: {query_text}
+                        "content": f"""User normalized query: {normalized_query}
+Domain priority: {tier_name}
 URL: {url}
 CONTENT: {excerpt_text[:3000]}
 
-Extract and return ONLY JSON with these fields:
-- title (string)
-- price (number or null)
-- currency (string, ISO code)
-- model (string or null)
-- availability (string or null)
-- review_snippets (array of strings, up to 10 short quotes)
-- match_score (number 0-1 for how well this product matches the user query)
+Return JSON:
+{{
+  "title": string,
+  "normalized_title": string,  // apply normalization rules: max 3 tokens (2-4 words), keep color and essential qualifiers, drop marketing filler
+  "price": number | null,
+  "currency": string | null,
+  "availability": string | null,
+  "model": string | null,
+  "match_score": number,       // 0-1 vs normalized_query
+  "review_snippets": string[], // <=10
+  "images": [
+    {{"url": string, "width": number|null, "height": number|null, "alt": string|null}}
+  ],
+  "primary_image_url": string | null
+}}
+
+Rules:
+- Prefer gallery/hero images; fall back to og:image/twitter:image if available in content
+- If multiple prices, pick the current new price; else null
+- normalized_title should be max 3 tokens (2-4 words), e.g., "black accent chair"
+- match_score should reflect how well this product matches "{normalized_query}"
 
 Return ONLY JSON, no other text."""
                     }
@@ -215,6 +319,15 @@ Return ONLY JSON, no other text."""
             product_data["match_score"] = 0.5
         if "review_snippets" not in product_data:
             product_data["review_snippets"] = []
+        if "images" not in product_data:
+            product_data["images"] = []
+        if "primary_image_url" not in product_data:
+            product_data["primary_image_url"] = None
+        
+        if "normalized_title" not in product_data or not product_data["normalized_title"]:
+            if "title" in product_data:
+                normalized = await normalize_name(product_data["title"])
+                product_data["normalized_title"] = normalized.get("normalized_query", product_data["title"])
         
         return product_data
     
@@ -222,7 +335,7 @@ Return ONLY JSON, no other text."""
         print(f"Product extraction failed for {url}: {str(e)}")
         return None
 
-async def analyze_reviews(review_snippets: List[str]) -> dict:
+async def analyze_reviews(review_snippets: List[str], normalized_title: str = "") -> dict:
     if not review_snippets or len(review_snippets) == 0:
         return {
             "review_sentiment": "unknown",
@@ -232,23 +345,24 @@ async def analyze_reviews(review_snippets: List[str]) -> dict:
     
     try:
         async def call_sentiment():
+            product_context = f"Product: {normalized_title}\n" if normalized_title else ""
             response = await client.chat.completions.create(
                 model="speed",
                 messages=[
                     {
                         "role": "system",
-                        "content": "You evaluate product reviews and identify likely fake/astroturfed content. Return JSON only."
+                        "content": "You evaluate product reviews and exclude likely fake content before summarizing sentiment."
                     },
                     {
                         "role": "user",
-                        "content": f"""Given these review_snippets, return ONLY JSON with these fields:
+                        "content": f"""{product_context}SNIPPETS: {json.dumps(review_snippets[:10])}
+
+Return ONLY JSON with these fields:
 - review_sentiment: "positive" or "neutral" or "negative"
 - sentiment_score: number 0-1
 - fake_review_probability: number 0-1 (use high values when snippets are repetitive, bursty, templated, or generic)
 
 If many snippets have fake_review_probability >0.7, ignore those and summarize sentiment from the remainder.
-
-Review snippets: {json.dumps(review_snippets[:10])}
 
 Return ONLY JSON, no other text."""
                     }
@@ -279,7 +393,7 @@ Return ONLY JSON, no other text."""
             "fake_review_probability": None
         }
 
-async def process_product(result: dict, query_text: str) -> Optional[ProductItem]:
+async def process_product(result: dict, normalized_query: str) -> Optional[ProductItem]:
     try:
         url = result.get("url", "")
         excerpts = result.get("excerpts", [])
@@ -287,19 +401,31 @@ async def process_product(result: dict, query_text: str) -> Optional[ProductItem
         if not url:
             return None
         
-        product_data = await extract_product_details(url, excerpts, query_text)
+        product_data = await extract_product_details(url, excerpts, normalized_query)
         
         if not product_data:
             return None
         
         review_snippets = product_data.get("review_snippets", [])
-        sentiment_data = await analyze_reviews(review_snippets)
+        normalized_title = product_data.get("normalized_title", "")
+        sentiment_data = await analyze_reviews(review_snippets, normalized_title)
         
         from urllib.parse import urlparse
         source = urlparse(url).netloc.replace("www.", "")
         
+        images = []
+        for img in product_data.get("images", []):
+            if isinstance(img, dict):
+                images.append(Image(
+                    url=img.get("url", ""),
+                    width=img.get("width"),
+                    height=img.get("height"),
+                    alt=img.get("alt")
+                ))
+        
         product = ProductItem(
             title=product_data["title"],
+            normalized_title=normalized_title,
             price=product_data.get("price"),
             currency=product_data.get("currency", "USD"),
             url=url,
@@ -308,7 +434,9 @@ async def process_product(result: dict, query_text: str) -> Optional[ProductItem
             availability=product_data.get("availability"),
             review_sentiment=sentiment_data["review_sentiment"],
             sentiment_score=sentiment_data.get("sentiment_score"),
-            fake_review_probability=sentiment_data.get("fake_review_probability")
+            fake_review_probability=sentiment_data.get("fake_review_probability"),
+            primary_image_url=product_data.get("primary_image_url"),
+            images=images
         )
         
         return product
@@ -321,38 +449,29 @@ async def search(request: ChatRequest):
     try:
         intake_response = await chat_intake(request)
         intent = intake_response.intent
+        normalized_query = intent.query_text
         
-        search_results = await search_products(intent)
+        search_results = await search_products(intent, normalized_query)
         
         if not search_results:
-            return SearchResponse(query=intent.query_text, items=[])
+            return SearchResponse(query=normalized_query, items=[])
         
-        tasks = [process_product(result, intent.query_text) for result in search_results[:6]]
+        tasks = [process_product(result, normalized_query) for result in search_results[:6]]
         products_results = await asyncio.gather(*tasks, return_exceptions=True)
         
         products = [p for p in products_results if isinstance(p, ProductItem)]
         
         filtered_products = [p for p in products if p.match_score >= 0.35]
         
-        def merchant_priority(source: str) -> int:
-            source_lower = source.lower()
-            if any(brand in source_lower for brand in ["apple", "samsung", "sony", "lg", "dell", "hp"]):
-                return 3
-            if any(retailer in source_lower for retailer in ["amazon", "walmart", "target", "bestbuy", "homedepot", "lowes", "ikea", "wayfair", "ashleyfurniture"]):
-                return 2
-            if any(market in source_lower for market in ["ebay", "etsy", "mercari"]):
-                return 1
-            return 0
-        
         filtered_products.sort(
             key=lambda p: (
                 -p.match_score,
-                -merchant_priority(p.source),
+                -get_domain_tier(p.url),
                 -(1 if p.price is not None else 0)
             )
         )
         
-        return SearchResponse(query=intent.query_text, items=filtered_products)
+        return SearchResponse(query=normalized_query, items=filtered_products)
     
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Search failed: {str(e)}")

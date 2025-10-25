@@ -6,10 +6,18 @@ import { Card, CardContent } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import './App.css'
 
+interface Image {
+  url: string
+  width: number | null
+  height: number | null
+  alt: string | null
+}
+
 interface ProductItem {
   title: string
+  normalized_title: string | null
   price: number | null
-  currency: string
+  currency: string | null
   url: string
   source: string
   match_score: number
@@ -17,6 +25,8 @@ interface ProductItem {
   sentiment_score: number | null
   fake_review_probability: number | null
   availability: string | null
+  primary_image_url: string | null
+  images: Image[]
 }
 
 interface SearchResponse {
@@ -182,9 +192,43 @@ function App() {
           {results?.items.map((item, index) => (
             <Card key={index} className="bg-white">
               <CardContent className="p-6">
+                {item.primary_image_url && (
+                  <div className="mb-4">
+                    <img 
+                      src={item.primary_image_url} 
+                      alt={item.normalized_title || item.title}
+                      className="w-full h-48 object-contain rounded-lg bg-gray-50"
+                      onError={(e) => {
+                        (e.target as HTMLImageElement).style.display = 'none'
+                      }}
+                    />
+                  </div>
+                )}
+                
+                {item.images.length > 1 && (
+                  <div className="flex gap-2 mb-4 overflow-x-auto">
+                    {item.images.slice(0, 4).map((img, imgIndex) => (
+                      <img
+                        key={imgIndex}
+                        src={img.url}
+                        alt={img.alt || `${item.normalized_title || item.title} thumbnail ${imgIndex + 1}`}
+                        className="w-16 h-16 object-cover rounded border border-gray-200 flex-shrink-0"
+                        onError={(e) => {
+                          (e.target as HTMLImageElement).style.display = 'none'
+                        }}
+                      />
+                    ))}
+                  </div>
+                )}
+
                 <div className="flex justify-between items-start mb-3">
                   <div className="flex-1">
-                    <h3 className="font-semibold text-gray-900 mb-1">{item.title}</h3>
+                    <h3 className="font-semibold text-gray-900 mb-1">
+                      {item.normalized_title || item.title}
+                    </h3>
+                    {item.normalized_title && item.normalized_title !== item.title && (
+                      <p className="text-xs text-gray-500 mb-1">{item.title}</p>
+                    )}
                     <p className="text-sm text-gray-600">{item.source}</p>
                   </div>
                   {item.availability && (
@@ -200,7 +244,7 @@ function App() {
 
                 <div className="mb-4">
                   <p className="text-2xl font-bold text-gray-900">
-                    {item.price !== null ? `$${item.price.toFixed(2)} ${item.currency}` : 'Price not available'}
+                    {item.price !== null && item.currency ? `$${item.price.toFixed(2)} ${item.currency}` : 'Price not available'}
                   </p>
                 </div>
 
