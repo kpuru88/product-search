@@ -61,6 +61,10 @@ class ProductItem(BaseModel):
     availability: Optional[str] = None
     primary_image_url: Optional[str] = None
     images: List[Image] = Field(default_factory=list)
+    sentiment_reason: Optional[str] = None
+    sentiment_highlights: List[str] = Field(default_factory=list)
+    product_type: Optional[str] = None
+    category_match: Optional[bool] = None
 
 class SearchResponse(BaseModel):
     query: str
@@ -157,6 +161,97 @@ Return ONLY JSON, no other text."""
             "keywords": [text],
             "keep_model": False
         }
+
+async def validate_image(url: str) -> bool:
+    """Validate image URL with lightweight GET request"""
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+            "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8"
+        }
+        async with httpx.AsyncClient(timeout=4.0) as http_client:
+            async with http_client.stream("GET", url, headers=headers, follow_redirects=True) as response:
+                if response.status_code == 200:
+                    content_type = response.headers.get("content-type", "")
+                    if content_type.startswith("image/"):
+                        return True
+                    if url.lower().endswith(('.jpg', '.jpeg', '.png', '.webp', '.gif')):
+                        return True
+        return False
+    except Exception:
+        if url.lower().endswith(('.jpg', '.jpeg', '.png', '.webp', '.gif')):
+            return True
+        return False
+
+async def get_page_media(url: str) -> dict:
+    """Extract images from page using Extract API"""
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as http_client:
+            response = await http_client.post(
+                "https://api.parallel.ai/v1beta/extract",
+                headers={
+                    "x-api-key": PARALLEL_API_KEY,
+                    "Content-Type": "application/json"
+                },
+                json={"url": url}
+            )
+            response.raise_for_status()
+            data = response.json()
+            
+            images = []
+            primary = None
+            
+            metadata = data.get("metadata", {})
+            if metadata.get("og:image"):
+                images.append({"url": metadata["og:image"], "width": None, "height": None, "alt": "og:image"})
+                primary = metadata["og:image"]
+            if metadata.get("twitter:image") and metadata.get("twitter:image") != primary:
+                images.append({"url": metadata["twitter:image"], "width": None, "height": None, "alt": "twitter:image"})
+                if not primary:
+                    primary = metadata["twitter:image"]
+            
+            content = data.get("content", "")
+            if "schema.org/Product" in content or '"@type":"Product"' in content:
+                try:
+                    import re
+                    json_ld_match = re.search(r'<script[^>]*type="application/ld\+json"[^>]*>(.*?)</script>', content, re.DOTALL)
+                    if json_ld_match:
+                        json_ld = json.loads(json_ld_match.group(1))
+                        if isinstance(json_ld, dict) and json_ld.get("@type") == "Product":
+                            product_images = json_ld.get("image", [])
+                            if isinstance(product_images, str):
+                                product_images = [product_images]
+                            for img_url in product_images[:3]:
+                                if img_url not in [i["url"] for i in images]:
+                                    images.append({"url": img_url, "width": None, "height": None, "alt": "product image"})
+                                    if not primary:
+                                        primary = img_url
+                except Exception:
+                    pass
+            
+            return {"images": images, "primary": primary}
+    except Exception as e:
+        print(f"Extract API failed for {url}: {str(e)}")
+        return {"images": [], "primary": None}
+
+def get_allowed_product_types(normalized_query: str) -> List[str]:
+    """Determine allowed product types based on normalized query"""
+    query_lower = normalized_query.lower()
+    
+    if "chair" in query_lower:
+        if any(word in query_lower for word in ["accent", "club", "barrel", "vanity", "slipper"]):
+            return ["accent chair", "club chair", "barrel chair", "vanity chair", "slipper chair", "armchair"]
+        elif "office" in query_lower or "desk" in query_lower:
+            return ["office chair", "desk chair", "task chair"]
+        elif "gaming" in query_lower:
+            return ["gaming chair"]
+        else:
+            return ["accent chair", "club chair", "barrel chair", "vanity chair", "slipper chair", "armchair", "side chair", "dining chair"]
+    
+    if any(word in query_lower for word in ["sofa", "couch"]):
+        return ["sofa", "couch", "loveseat", "sectional", "sleeper sofa"]
+    
+    return []
 
 @app.post("/api/chat/intake", response_model=ChatIntakeResponse)
 async def chat_intake(request: ChatRequest):
@@ -259,6 +354,9 @@ async def extract_product_details(url: str, excerpts: List[str], normalized_quer
         domain_tier = get_domain_tier(url)
         tier_name = "manufacturer" if domain_tier == 3 else "major retailer" if domain_tier == 2 else "marketplace" if domain_tier == 1 else "other"
         
+        allowed_types = get_allowed_product_types(normalized_query)
+        allowed_types_str = ", ".join(allowed_types) if allowed_types else "any product type"
+        
         async def call_extract():
             response = await client.chat.completions.create(
                 model="speed",
@@ -277,24 +375,25 @@ CONTENT: {excerpt_text[:3000]}
 Return JSON:
 {{
   "title": string,
-  "normalized_title": string,  // apply normalization rules: max 3 tokens (2-4 words), keep color and essential qualifiers, drop marketing filler
+  "normalized_title": string,
   "price": number | null,
   "currency": string | null,
   "availability": string | null,
   "model": string | null,
-  "match_score": number,       // 0-1 vs normalized_query
-  "review_snippets": string[], // <=10
-  "images": [
-    {{"url": string, "width": number|null, "height": number|null, "alt": string|null}}
-  ],
-  "primary_image_url": string | null
+  "match_score": number,
+  "review_snippets": string[],
+  "images": [{{"url": string, "width": number|null, "height": number|null, "alt": string|null}}],
+  "primary_image_url": string | null,
+  "product_type": string,
+  "category_match": boolean
 }}
 
 Rules:
-- Prefer gallery/hero images; fall back to og:image/twitter:image if available in content
-- If multiple prices, pick the current new price; else null
-- normalized_title should be max 3 tokens (2-4 words), e.g., "black accent chair"
-- match_score should reflect how well this product matches "{normalized_query}"
+- normalized_title: max 3 tokens (2-4 words), e.g., "black accent chair"
+- match_score: 0-1 vs normalized_query
+- product_type: classify as one of: accent chair, club chair, barrel chair, office chair, gaming chair, sofa, loveseat, sectional, couch, desk, table, or other
+- category_match: true if product_type matches query intent. Query expects: {allowed_types_str}
+- Prefer gallery/hero images; fall back to og:image/twitter:image if available
 
 Return ONLY JSON, no other text."""
                     }
@@ -323,11 +422,30 @@ Return ONLY JSON, no other text."""
             product_data["images"] = []
         if "primary_image_url" not in product_data:
             product_data["primary_image_url"] = None
+        if "product_type" not in product_data:
+            product_data["product_type"] = "other"
+        if "category_match" not in product_data:
+            product_data["category_match"] = True
         
         if "normalized_title" not in product_data or not product_data["normalized_title"]:
             if "title" in product_data:
                 normalized = await normalize_name(product_data["title"])
                 product_data["normalized_title"] = normalized.get("normalized_query", product_data["title"])
+        
+        if not product_data.get("primary_image_url") or not product_data.get("images"):
+            media = await get_page_media(url)
+            if media["primary"] and not product_data.get("primary_image_url"):
+                product_data["primary_image_url"] = media["primary"]
+            if media["images"] and not product_data.get("images"):
+                product_data["images"] = media["images"]
+        
+        if product_data.get("primary_image_url"):
+            is_valid = await validate_image(product_data["primary_image_url"])
+            if not is_valid:
+                for img in product_data.get("images", []):
+                    if await validate_image(img.get("url", "")):
+                        product_data["primary_image_url"] = img["url"]
+                        break
         
         return product_data
     
@@ -340,7 +458,9 @@ async def analyze_reviews(review_snippets: List[str], normalized_title: str = ""
         return {
             "review_sentiment": "unknown",
             "sentiment_score": None,
-            "fake_review_probability": None
+            "fake_review_probability": None,
+            "sentiment_reason": None,
+            "sentiment_highlights": []
         }
     
     try:
@@ -351,18 +471,25 @@ async def analyze_reviews(review_snippets: List[str], normalized_title: str = ""
                 messages=[
                     {
                         "role": "system",
-                        "content": "You evaluate product reviews and exclude likely fake content before summarizing sentiment."
+                        "content": "You evaluate product reviews and exclude likely fake content before summarizing sentiment. Provide detailed reasoning and evidence."
                     },
                     {
                         "role": "user",
                         "content": f"""{product_context}SNIPPETS: {json.dumps(review_snippets[:10])}
 
+Analyze these review snippets. First, label each snippet as positive/neutral/negative and identify fake ones (repetitive, templated, generic, bursty patterns).
+
+Filter out snippets with fake_review_probability >0.7. Then compute sentiment from the remaining snippets.
+
 Return ONLY JSON with these fields:
 - review_sentiment: "positive" or "neutral" or "negative"
-- sentiment_score: number 0-1
-- fake_review_probability: number 0-1 (use high values when snippets are repetitive, bursty, templated, or generic)
+- sentiment_score: number 0-1 (based on proportion of positive vs negative in kept snippets, NOT a default 0.85)
+- fake_review_probability: number 0-1 (aggregate of kept snippets, e.g., 95th percentile)
+- reason: string (1-3 sentences explaining WHY this sentiment, citing specific themes)
+- highlights: array of 3-5 strings (concise points extracted from kept snippets, e.g., "Comfortable seating", "Easy assembly", "Great value")
 
-If many snippets have fake_review_probability >0.7, ignore those and summarize sentiment from the remainder.
+Example:
+{{"review_sentiment": "positive", "sentiment_score": 0.78, "fake_review_probability": 0.2, "reason": "Most reviews praise the chair's comfort and sturdy build quality, though some mention minor assembly issues.", "highlights": ["Very comfortable padding", "Sturdy metal frame", "Easy to assemble", "Good value for price", "Stylish design"]}}
 
 Return ONLY JSON, no other text."""
                     }
@@ -376,21 +503,28 @@ Return ONLY JSON, no other text."""
         
         try:
             sentiment_data = json.loads(content)
+            if "reason" not in sentiment_data:
+                sentiment_data["reason"] = None
+            if "highlights" not in sentiment_data:
+                sentiment_data["highlights"] = []
+            return sentiment_data
         except json.JSONDecodeError:
             return {
                 "review_sentiment": "unknown",
                 "sentiment_score": None,
-                "fake_review_probability": None
+                "fake_review_probability": None,
+                "sentiment_reason": None,
+                "sentiment_highlights": []
             }
-        
-        return sentiment_data
     
     except Exception as e:
         print(f"Sentiment analysis failed: {str(e)}")
         return {
             "review_sentiment": "unknown",
             "sentiment_score": None,
-            "fake_review_probability": None
+            "fake_review_probability": None,
+            "sentiment_reason": None,
+            "sentiment_highlights": []
         }
 
 async def process_product(result: dict, normalized_query: str) -> Optional[ProductItem]:
@@ -436,7 +570,11 @@ async def process_product(result: dict, normalized_query: str) -> Optional[Produ
             sentiment_score=sentiment_data.get("sentiment_score"),
             fake_review_probability=sentiment_data.get("fake_review_probability"),
             primary_image_url=product_data.get("primary_image_url"),
-            images=images
+            images=images,
+            sentiment_reason=sentiment_data.get("reason"),
+            sentiment_highlights=sentiment_data.get("highlights", []),
+            product_type=product_data.get("product_type"),
+            category_match=product_data.get("category_match", True)
         )
         
         return product
@@ -466,6 +604,7 @@ async def search(request: ChatRequest):
         filtered_products.sort(
             key=lambda p: (
                 -p.match_score,
+                -(1 if p.category_match else 0),
                 -get_domain_tier(p.url),
                 -(1 if p.price is not None else 0)
             )

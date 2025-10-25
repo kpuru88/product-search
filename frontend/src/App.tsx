@@ -27,6 +27,10 @@ interface ProductItem {
   availability: string | null
   primary_image_url: string | null
   images: Image[]
+  sentiment_reason: string | null
+  sentiment_highlights: string[]
+  product_type: string | null
+  category_match: boolean | null
 }
 
 interface SearchResponse {
@@ -262,12 +266,26 @@ function App() {
                 </div>
 
                 {item.review_sentiment !== 'unknown' && (
-                  <div className="flex items-center gap-2 mb-4">
-                    {getSentimentIcon(item.review_sentiment)}
-                    <span className={`text-sm font-medium ${getSentimentColor(item.review_sentiment)}`}>
-                      Sentiment: {item.review_sentiment.charAt(0).toUpperCase() + item.review_sentiment.slice(1)}
-                      {item.sentiment_score !== null && ` (${Math.round(item.sentiment_score * 100)}%)`}
-                    </span>
+                  <div className="mb-4">
+                    <div className="flex items-center gap-2 mb-2">
+                      {getSentimentIcon(item.review_sentiment)}
+                      <span className={`text-sm font-medium ${getSentimentColor(item.review_sentiment)}`}>
+                        Sentiment: {item.review_sentiment.charAt(0).toUpperCase() + item.review_sentiment.slice(1)}
+                        {item.sentiment_score !== null && ` (${Math.round(item.sentiment_score * 100)}%)`}
+                      </span>
+                    </div>
+                    {item.sentiment_reason && (
+                      <p className="text-xs text-gray-600 mb-2 italic">{item.sentiment_reason}</p>
+                    )}
+                    {item.sentiment_highlights && item.sentiment_highlights.length > 0 && (
+                      <div className="flex flex-wrap gap-1">
+                        {item.sentiment_highlights.slice(0, 5).map((highlight, idx) => (
+                          <Badge key={idx} variant="secondary" className="text-xs bg-gray-100 text-gray-700">
+                            {highlight}
+                          </Badge>
+                        ))}
+                      </div>
+                    )}
                   </div>
                 )}
 
