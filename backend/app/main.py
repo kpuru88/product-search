@@ -1,5 +1,6 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from typing import List, Optional, Literal
 import os
@@ -51,6 +52,8 @@ class ProductItem(BaseModel):
     title: str
     normalized_title: Optional[str] = None
     price: Optional[float] = None
+    price_min: Optional[float] = None
+    price_max: Optional[float] = None
     currency: Optional[str] = "USD"
     url: str
     source: str
@@ -65,6 +68,7 @@ class ProductItem(BaseModel):
     sentiment_highlights: List[str] = Field(default_factory=list)
     product_type: Optional[str] = None
     category_match: Optional[bool] = None
+    is_listing_page: Optional[bool] = False
 
 class SearchResponse(BaseModel):
     query: str
@@ -253,6 +257,335 @@ def get_allowed_product_types(normalized_query: str) -> List[str]:
     
     return []
 
+async def fetch_html(url: str) -> Optional[str]:
+    """Fetch HTML content with httpx GET fallback"""
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+        
+        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+            response = await client.get(url, headers=headers)
+            if response.status_code == 200:
+                return response.text
+            else:
+                print(f"Failed to fetch HTML for {url}: {response.status_code}")
+                return None
+    except Exception as e:
+        print(f"HTML fetch failed for {url}: {str(e)}")
+        return None
+
+async def classify_page(url: str, html: str) -> dict:
+    """Classify page as homepage, listing, or PDP"""
+    from urllib.parse import urlparse
+    import re
+    
+    parsed = urlparse(url)
+    path = parsed.path.lower()
+    
+    page_type = "pdp"
+    reasons = []
+    jsonld_types = []
+    
+    try:
+        jsonld_pattern = r'<script[^>]*type=["\']application/ld\+json["\'][^>]*>(.*?)</script>'
+        jsonld_blocks = re.findall(jsonld_pattern, html, re.DOTALL | re.IGNORECASE)
+        
+        for block in jsonld_blocks:
+            try:
+                data = json.loads(block)
+                
+                def extract_types(obj, types_list):
+                    if isinstance(obj, dict):
+                        if '@type' in obj:
+                            type_val = obj['@type']
+                            if isinstance(type_val, list):
+                                types_list.extend(type_val)
+                            else:
+                                types_list.append(type_val)
+                        for value in obj.values():
+                            if isinstance(value, (dict, list)):
+                                extract_types(value, types_list)
+                    elif isinstance(obj, list):
+                        for item in obj:
+                            extract_types(item, types_list)
+                
+                extract_types(data, jsonld_types)
+            except:
+                continue
+    except:
+        pass
+    
+    if path in ['', '/'] or len(path) <= 2:
+        page_type = "homepage"
+        reasons.append("URL path is root or very short")
+    elif any(t in jsonld_types for t in ['WebSite', 'Organization']) and not any(t in jsonld_types for t in ['Product', 'ItemList']):
+        page_type = "homepage"
+        reasons.append("JSON-LD contains only WebSite/Organization")
+    elif any(pattern in path for pattern in ['/shop/', '/category/', '/search', '/browse', '/c/', '/pl/', '/products/', '/collections/']):
+        page_type = "listing"
+        reasons.append("URL contains listing/category patterns")
+    elif '?q=' in url or '?s=' in url or 'search=' in url.lower():
+        page_type = "listing"
+        reasons.append("URL contains search query params")
+    elif any(t in jsonld_types for t in ['ItemList', 'SearchResultsPage', 'CollectionPage']):
+        page_type = "listing"
+        reasons.append("JSON-LD contains ItemList/SearchResultsPage")
+    elif 'Product' in jsonld_types and any(pattern in path for pattern in ['/product/', '/p/', '/dp/', '/sku/', '/item/']):
+        page_type = "pdp"
+        reasons.append("JSON-LD Product + PDP URL pattern")
+    
+    price_count = len(re.findall(r'\$\s*\d+(?:,\d{3})*(?:\.\d{2})?', html[:50000]))
+    if price_count > 10 and page_type != "homepage":
+        if page_type == "pdp":
+            page_type = "listing"
+        reasons.append(f"Multiple prices found ({price_count})")
+    
+    return {
+        "type": page_type,
+        "reasons": reasons,
+        "jsonld_types": jsonld_types
+    }
+
+async def expand_listing(url: str, html: str, max_products: int = 5) -> List[dict]:
+    """Extract individual product URLs and prices from listing page"""
+    import re
+    from urllib.parse import urljoin, urlparse
+    
+    products = []
+    
+    try:
+        jsonld_pattern = r'<script[^>]*type=["\']application/ld\+json["\'][^>]*>(.*?)</script>'
+        jsonld_blocks = re.findall(jsonld_pattern, html, re.DOTALL | re.IGNORECASE)
+        
+        for block in jsonld_blocks:
+            try:
+                data = json.loads(block)
+                
+                def extract_products_from_jsonld(obj):
+                    if isinstance(obj, dict):
+                        if obj.get('@type') == 'ItemList' and 'itemListElement' in obj:
+                            for item in obj['itemListElement']:
+                                if isinstance(item, dict):
+                                    product_obj = item.get('item', item)
+                                    if isinstance(product_obj, dict):
+                                        product_url = product_obj.get('url')
+                                        product_name = product_obj.get('name')
+                                        
+                                        price = None
+                                        currency = None
+                                        
+                                        if 'offers' in product_obj:
+                                            offers = product_obj['offers']
+                                            if isinstance(offers, dict):
+                                                price = offers.get('price') or offers.get('lowPrice')
+                                                currency = offers.get('priceCurrency', 'USD')
+                                            elif isinstance(offers, list) and len(offers) > 0:
+                                                price = offers[0].get('price')
+                                                currency = offers[0].get('priceCurrency', 'USD')
+                                        
+                                        if product_url:
+                                            products.append({
+                                                'url': urljoin(url, product_url),
+                                                'title': product_name,
+                                                'price': float(price) if price else None,
+                                                'currency': currency
+                                            })
+                        
+                        elif obj.get('@type') == 'Product':
+                            product_url = obj.get('url')
+                            product_name = obj.get('name')
+                            
+                            price = None
+                            currency = None
+                            
+                            if 'offers' in obj:
+                                offers = obj['offers']
+                                if isinstance(offers, dict):
+                                    price = offers.get('price') or offers.get('lowPrice')
+                                    currency = offers.get('priceCurrency', 'USD')
+                                elif isinstance(offers, list) and len(offers) > 0:
+                                    price = offers[0].get('price')
+                                    currency = offers[0].get('priceCurrency', 'USD')
+                            
+                            if product_url:
+                                products.append({
+                                    'url': urljoin(url, product_url),
+                                    'title': product_name,
+                                    'price': float(price) if price else None,
+                                    'currency': currency
+                                })
+                        
+                        for value in obj.values():
+                            if isinstance(value, (dict, list)):
+                                extract_products_from_jsonld(value)
+                    
+                    elif isinstance(obj, list):
+                        for item in obj:
+                            extract_products_from_jsonld(item)
+                
+                extract_products_from_jsonld(data)
+            except:
+                continue
+    except:
+        pass
+    
+    if len(products) < max_products:
+        link_patterns = [
+            r'<a[^>]*href=["\']([^"\']*(?:/product/|/p/|/dp/|/sku/|/item/)[^"\']*)["\']',
+            r'<a[^>]*data-asin=["\']([^"\']+)["\']',
+            r'<a[^>]*data-sku=["\']([^"\']+)["\']',
+        ]
+        
+        for pattern in link_patterns:
+            matches = re.findall(pattern, html, re.IGNORECASE)
+            for match in matches[:max_products * 2]:
+                if match.startswith('http'):
+                    product_url = match
+                else:
+                    product_url = urljoin(url, match)
+                
+                if product_url not in [p['url'] for p in products]:
+                    products.append({
+                        'url': product_url,
+                        'title': None,
+                        'price': None,
+                        'currency': 'USD'
+                    })
+                
+                if len(products) >= max_products:
+                    break
+            
+            if len(products) >= max_products:
+                break
+    
+    seen_urls = set()
+    unique_products = []
+    for p in products:
+        if p['url'] not in seen_urls:
+            seen_urls.add(p['url'])
+            unique_products.append(p)
+    
+    print(f"Expanded listing {url}: found {len(unique_products)} products")
+    return unique_products[:max_products]
+
+def detect_listing_page(url: str, content: str) -> bool:
+    """Detect if URL is a category/listing page vs a product detail page"""
+    url_lower = url.lower()
+    
+    listing_indicators = ['/search', '/browse', '/category', '/shop', '/s?', '/b/', '/c/', '/results']
+    if any(indicator in url_lower for indicator in listing_indicators):
+        return True
+    
+    if '"@type":"ItemList"' in content or '"@type": "ItemList"' in content:
+        return True
+    
+    return False
+
+async def extract_price_range(content: str) -> dict:
+    """Extract price range from listing page content using JSON-LD and regex"""
+    try:
+        import re
+        import json
+        
+        prices = []
+        
+        try:
+            jsonld_pattern = r'<script[^>]*type=["\']application/ld\+json["\'][^>]*>(.*?)</script>'
+            jsonld_blocks = re.findall(jsonld_pattern, content, re.DOTALL | re.IGNORECASE)
+            
+            for block in jsonld_blocks:
+                try:
+                    data = json.loads(block)
+                    
+                    def extract_prices_from_jsonld(obj):
+                        if isinstance(obj, dict):
+                            if obj.get('@type') == 'AggregateOffer':
+                                if 'lowPrice' in obj:
+                                    try:
+                                        prices.append(float(str(obj['lowPrice']).replace(',', '')))
+                                    except (ValueError, TypeError):
+                                        pass
+                                if 'highPrice' in obj:
+                                    try:
+                                        prices.append(float(str(obj['highPrice']).replace(',', '')))
+                                    except (ValueError, TypeError):
+                                        pass
+                            
+                            if obj.get('@type') in ['Offer', 'Product']:
+                                if 'price' in obj:
+                                    try:
+                                        prices.append(float(str(obj['price']).replace(',', '')))
+                                    except (ValueError, TypeError):
+                                        pass
+                                if 'offers' in obj:
+                                    extract_prices_from_jsonld(obj['offers'])
+                            
+                            if obj.get('@type') == 'ItemList' and 'itemListElement' in obj:
+                                for item in obj['itemListElement']:
+                                    if isinstance(item, dict):
+                                        if 'item' in item:
+                                            extract_prices_from_jsonld(item['item'])
+                                        else:
+                                            extract_prices_from_jsonld(item)
+                            
+                            for value in obj.values():
+                                if isinstance(value, (dict, list)):
+                                    extract_prices_from_jsonld(value)
+                        
+                        elif isinstance(obj, list):
+                            for item in obj:
+                                extract_prices_from_jsonld(item)
+                    
+                    extract_prices_from_jsonld(data)
+                except json.JSONDecodeError:
+                    continue
+        except Exception as e:
+            print(f"JSON-LD parsing failed: {str(e)}")
+        
+        price_patterns = [
+            r'\$\s*(\d+(?:,\d{3})*(?:\.\d{2})?)',  # Standard $199 or $1,999.99
+            r'(?:From|from|Starting at|starting at)\s+\$\s*(\d+(?:,\d{3})*(?:\.\d{2})?)',  # From $199
+            r'(?:Now|now|Sale|sale|SALE)\s+\$\s*(\d+(?:,\d{3})*(?:\.\d{2})?)',  # Now $199, Sale $199
+            r'\$\s*(\d+(?:,\d{3})*(?:\.\d{2})?)\s*[-–—]\s*\$\s*(\d+(?:,\d{3})*(?:\.\d{2})?)',  # $199–$399 (range)
+        ]
+        
+        for pattern in price_patterns:
+            matches = re.findall(pattern, content, re.IGNORECASE)
+            for match in matches:
+                if isinstance(match, tuple):
+                    for price_str in match:
+                        try:
+                            price = float(price_str.replace(',', ''))
+                            if 5 <= price <= 100000:
+                                prices.append(price)
+                        except ValueError:
+                            continue
+                else:
+                    try:
+                        price = float(match.replace(',', ''))
+                        if 5 <= price <= 100000:
+                            prices.append(price)
+                    except ValueError:
+                        continue
+        
+        if not prices:
+            print(f"No prices found in content (length: {len(content)} chars)")
+            return {"price_min": None, "price_max": None}
+        
+        prices = sorted(set(prices))
+        print(f"Found {len(prices)} unique prices: {prices[:10]}...")  # Log first 10 for debugging
+        
+        return {
+            "price_min": min(prices),
+            "price_max": max(prices)
+        }
+    except Exception as e:
+        print(f"Price range extraction failed: {str(e)}")
+        return {"price_min": None, "price_max": None}
+
 @app.post("/api/chat/intake", response_model=ChatIntakeResponse)
 async def chat_intake(request: ChatRequest):
     try:
@@ -312,9 +645,11 @@ async def search_products(intent: SearchIntent, normalized_query: str) -> List[d
         manufacturer_domains = ", ".join(MANUFACTURER_DOMAINS[:5])
         retailer_domains = ", ".join(MAJOR_RETAILERS[:10])
         
-        objective = f"""Find US ecommerce product purchase pages for: "{normalized_query}". 
+        objective = f"""Find US ecommerce product detail pages (PDPs) for: "{normalized_query}". 
 Strictly prioritize PDPs from: {manufacturer_domains}, {retailer_domains}. 
-Return URLs that display current price. Exclude forums/news/review-only pages. 
+Return product detail pages that show current price for a single product. 
+Avoid category/search/listing pages unless not enough PDPs are available.
+Exclude forums/news/review-only pages. 
 Include synonyms where helpful (e.g., "sofa" for "couch"). Provide at least 8 PDPs if available."""
         
         async def call_search():
@@ -356,6 +691,8 @@ async def extract_product_details(url: str, excerpts: List[str], normalized_quer
         
         allowed_types = get_allowed_product_types(normalized_query)
         allowed_types_str = ", ".join(allowed_types) if allowed_types else "any product type"
+        
+        is_listing = detect_listing_page(url, excerpt_text)
         
         async def call_extract():
             response = await client.chat.completions.create(
@@ -446,6 +783,34 @@ Return ONLY JSON, no other text."""
                     if await validate_image(img.get("url", "")):
                         product_data["primary_image_url"] = img["url"]
                         break
+        
+        product_data["is_listing_page"] = is_listing
+        
+        if is_listing and not product_data.get("price"):
+            try:
+                async with httpx.AsyncClient(timeout=30.0) as extract_client:
+                    extract_response = await extract_client.post(
+                        "https://api.parallel.ai/v1beta/extract",
+                        headers={
+                            "Authorization": f"Bearer {PARALLEL_API_KEY}",
+                            "Content-Type": "application/json"
+                        },
+                        json={"url": url}
+                    )
+                    if extract_response.status_code == 200:
+                        extract_data = extract_response.json()
+                        full_content = extract_data.get("content", "")
+                        print(f"Fetched full content for listing page {url}: {len(full_content)} chars")
+                        price_range = await extract_price_range(full_content)
+                    else:
+                        print(f"Extract API failed for {url}: {extract_response.status_code}")
+                        price_range = await extract_price_range(excerpt_text)
+            except Exception as e:
+                print(f"Extract API call failed for {url}: {str(e)}")
+                price_range = await extract_price_range(excerpt_text)
+            
+            product_data["price_min"] = price_range.get("price_min")
+            product_data["price_max"] = price_range.get("price_max")
         
         return product_data
     
@@ -561,6 +926,8 @@ async def process_product(result: dict, normalized_query: str) -> Optional[Produ
             title=product_data["title"],
             normalized_title=normalized_title,
             price=product_data.get("price"),
+            price_min=product_data.get("price_min"),
+            price_max=product_data.get("price_max"),
             currency=product_data.get("currency", "USD"),
             url=url,
             source=source,
@@ -574,7 +941,8 @@ async def process_product(result: dict, normalized_query: str) -> Optional[Produ
             sentiment_reason=sentiment_data.get("reason"),
             sentiment_highlights=sentiment_data.get("highlights", []),
             product_type=product_data.get("product_type"),
-            category_match=product_data.get("category_match", True)
+            category_match=product_data.get("category_match", True),
+            is_listing_page=product_data.get("is_listing_page", False)
         )
         
         return product
@@ -594,23 +962,67 @@ async def search(request: ChatRequest):
         if not search_results:
             return SearchResponse(query=normalized_query, items=[])
         
-        tasks = [process_product(result, normalized_query) for result in search_results[:6]]
+        url_queue = []
+        
+        for result in search_results[:8]:
+            url = result.get("url", "")
+            if not url:
+                continue
+            
+            html = await fetch_html(url)
+            if not html:
+                url_queue.append({"url": url, "page_type": "pdp", "excerpts": result.get("excerpts", [])})
+                continue
+            
+            classification = await classify_page(url, html)
+            page_type = classification["type"]
+            
+            print(f"Classified {url} as {page_type}: {', '.join(classification['reasons'])}")
+            
+            if page_type == "homepage":
+                url_queue.append({"url": url, "page_type": "homepage", "excerpts": result.get("excerpts", [])})
+            elif page_type == "listing":
+                expanded_products = await expand_listing(url, html, max_products=5)
+                for exp_product in expanded_products:
+                    url_queue.append({
+                        "url": exp_product["url"],
+                        "page_type": "pdp",
+                        "excerpts": [],
+                        "from_listing": url
+                    })
+                if len(expanded_products) == 0:
+                    url_queue.append({"url": url, "page_type": "listing", "excerpts": result.get("excerpts", [])})
+            else:
+                url_queue.append({"url": url, "page_type": "pdp", "excerpts": result.get("excerpts", [])})
+        
+        tasks = [process_product(item, normalized_query) for item in url_queue[:10]]
         products_results = await asyncio.gather(*tasks, return_exceptions=True)
         
         products = [p for p in products_results if isinstance(p, ProductItem)]
         
         filtered_products = [p for p in products if p.match_score >= 0.35]
         
-        filtered_products.sort(
+        seen_products = set()
+        deduped_products = []
+        for p in filtered_products:
+            key = f"{p.normalized_title}|{p.source}"
+            if key not in seen_products:
+                seen_products.add(key)
+                deduped_products.append(p)
+        
+        deduped_products.sort(
             key=lambda p: (
                 -p.match_score,
                 -(1 if p.category_match else 0),
+                -(0 if p.is_listing_page else 1),
+                -(1 if getattr(p, 'page_type', 'pdp') == 'pdp' else 0),
+                -(1 if getattr(p, 'page_type', 'pdp') == 'listing' else 0),
                 -get_domain_tier(p.url),
                 -(1 if p.price is not None else 0)
             )
         )
         
-        return SearchResponse(query=normalized_query, items=filtered_products)
+        return SearchResponse(query=normalized_query, items=deduped_products[:6])
     
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Search failed: {str(e)}")
@@ -625,3 +1037,30 @@ async def diagnostics():
         "has_api_key": bool(PARALLEL_API_KEY),
         "api_key_length": len(PARALLEL_API_KEY) if PARALLEL_API_KEY else 0
     }
+
+@app.get("/api/image-proxy")
+async def image_proxy(url: str):
+    """Proxy images to avoid CORS and hotlinking issues"""
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+            "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8"
+        }
+        
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(url, headers=headers, follow_redirects=True)
+            response.raise_for_status()
+            
+            content_type = response.headers.get("content-type", "image/jpeg")
+            
+            return StreamingResponse(
+                iter([response.content]),
+                media_type=content_type,
+                headers={
+                    "Cache-Control": "public, max-age=86400",
+                    "Access-Control-Allow-Origin": "*"
+                }
+            )
+    except Exception as e:
+        print(f"Image proxy failed for {url}: {str(e)}")
+        raise HTTPException(status_code=404, detail="Image not found")
